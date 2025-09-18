@@ -1,30 +1,10 @@
-# Build a v4 package that fixes "Missing data" by aggregating by Round and joining metrics
-# across sheets. Includes robust numeric parsing and a data-binding wizard.
-# Output: /mnt/data/GangaJamuna_VP_Dashboard_v4.zip
-
-import os, shutil, zipfile
-from pathlib import Path
-
-root = Path("/mnt/data/GangaJamuna_VP_Dashboard_v4")
-data_dir = root / "data"
-streamlit_dir = root / ".streamlit"
-root.mkdir(parents=True, exist_ok=True)
-data_dir.mkdir(parents=True, exist_ok=True)
-streamlit_dir.mkdir(parents=True, exist_ok=True)
-
-# Copy datasets if present
-for src in ["/mnt/data/TFC_0_6.xlsx", "/mnt/data/FinanceReport (6).xlsx"]:
-    if Path(src).exists():
-        shutil.copy2(src, data_dir / Path(src).name)
-
-app_py = r'''
 import streamlit as st
 import pandas as pd
 import numpy as np
 import re, json
 from pathlib import Path
 
-# Optional plotting backends
+# ---- Optional plotting backends (Plotly preferred, Altair fallback)
 HAS_PLOTLY = True
 try:
     import plotly.express as px
@@ -49,17 +29,52 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ========================= LOAD DATA =========================
 DATA_DIR = Path("data")
+EXPECTED_NAMES = [
+    "TFC_0_6.xlsx",
+    "FinanceReport_6.xlsx",       # safe alias
+    "FinanceReport (6).xlsx",     # original
+]
+
+# ========================= FILES: LOCAL + UPLOAD =========================
+def find_local_excels():
+    files = []
+    if DATA_DIR.exists():
+        # include expected names first for determinism
+        for name in EXPECTED_NAMES:
+            p = DATA_DIR / name
+            if p.exists(): files.append(str(p))
+        # include any other .xlsx
+        for p in DATA_DIR.glob("*.xlsx"):
+            if str(p) not in files:
+                files.append(str(p))
+    return files
+
+st.sidebar.markdown("### Data Source")
+use_files = find_local_excels()
+
+uploaded = st.sidebar.file_uploader("Upload one or more .xlsx files", type=["xlsx"], accept_multiple_files=True)
+if uploaded:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    for uf in uploaded:
+        dest = DATA_DIR / uf.name
+        with open(dest, "wb") as f:
+            f.write(uf.getbuffer())
+        if str(dest) not in use_files:
+            use_files.append(str(dest))
+
+if len(use_files) == 0:
+    st.sidebar.warning("No Excel files found yet. Upload above or add files to the `data/` folder.")
+else:
+    st.sidebar.write("**Using files:**")
+    for f in use_files:
+        st.sidebar.write(f"- {Path(f).name}")
 
 @st.cache_data(show_spinner=False)
-def load_all_xlsx(data_dir: Path):
-    files = []
-    if data_dir.exists():
-        for p in sorted(list(data_dir.glob("*.xlsx"))):
-            files.append(p)
+def load_excels(filepaths):
     frames, meta = [], []
-    for p in files:
+    for f in filepaths:
+        p = Path(f)
         try:
             xls = pd.ExcelFile(p)
             for s in xls.sheet_names:
@@ -69,18 +84,22 @@ def load_all_xlsx(data_dir: Path):
                     df["__source_file__"] = p.name
                     df["__sheet__"] = s
                     frames.append(df)
-                    meta.append({"file": p.name, "sheet": s, "rows": int(len(df)), "cols": [str(c) for c in df.columns]})
+                    meta.append({
+                        "file": p.name, "sheet": s,
+                        "rows": int(len(df)), "cols": [str(c) for c in df.columns]
+                    })
                 except Exception as e:
                     meta.append({"file": p.name, "sheet": s, "error": str(e)})
         except Exception as e:
-            meta.append({"file": p.name, "error": f"Failed to read: {e}"})
+            meta.append({"file": (p.name if p.exists() else str(p)), "error": f"Failed to read: {e}"})
     return frames, meta
 
-frames, meta = load_all_xlsx(DATA_DIR)
-if len(frames)==0:
-    st.error("No Excel files found. Place .xlsx files under ./data or upload via sidebar.")
+frames, meta = load_excels(use_files)
+if len(frames) == 0:
+    st.error("Could not load any sheets from the selected files. Please verify the Excel files.")
     st.stop()
 
+# ========================= CONCAT (ACROSS SHEETS) =========================
 def safe_concat(dfs):
     if len(dfs) == 0:
         return pd.DataFrame()
@@ -98,7 +117,7 @@ def safe_concat(dfs):
 
 raw = safe_concat(frames)
 
-# ========================= COLUMN & TYPE HELPERS =========================
+# ========================= HELPERS =========================
 def match_col(candidates, patterns, default=None):
     if isinstance(patterns, str): patterns=[patterns]
     for pat in patterns:
@@ -108,37 +127,32 @@ def match_col(candidates, patterns, default=None):
     return default
 
 def parse_number(x):
-    """Parse numbers like '1,234', '12.3%', '€5,400.90', or '(1,234)'."""
+    """Parse numbers like '1,234', '12.3%', '€5,400.90', '(1,234)'."""
     if pd.isna(x): return np.nan
     if isinstance(x, (int,float)): return x
     s = str(x).strip()
     if s == "": return np.nan
-    # handle parentheses negatives
     neg = False
     if s.startswith("(") and s.endswith(")"):
         neg = True
         s = s[1:-1]
-    # remove currency and spaces
-    s = re.sub(r"[^\d\.\,\-\+%]", "", s)
-    # percent?
+    s = re.sub(r"[^\d\.\,\-\+%]", "", s)  # keep digits, . , - + %
     is_pct = s.endswith("%")
     s = s.replace("%","")
-    # remove thousand separators
     if s.count(",")>0 and s.count(".")<=1:
         s = s.replace(",", "")
     try:
         val = float(s)
         if neg: val = -val
-        if is_pct: val = val  # keep percentage in 0–100 scale
+        if is_pct: val = val  # keep % in 0–100 scale
         return val
     except:
         return np.nan
 
-def to_num(series):
-    return series.apply(parse_number)
+def to_num(series): return series.apply(parse_number)
 
+# ========================= AUTO MAP (OVERRIDABLE) =========================
 cands = list(map(str, raw.columns))
-
 defaults = {
     "round": match_col(cands, [r"^round$", r"week", r"period", r"cycle", r"game\s*round"]),
     "date": match_col(cands, [r"\bdate\b"]),
@@ -171,8 +185,7 @@ defaults = {
 }
 
 with st.sidebar:
-    st.markdown("### Data & Mapping")
-    st.caption("Override any auto-detected columns below.")
+    st.markdown("### Filters & KPI Mapper")
     options = ["—"] + cands
     mapper = {}
     for k, v in defaults.items():
@@ -192,7 +205,7 @@ inb_util_col = mapper["InboundUtil"]; outb_util_col = mapper["OutboundUtil"]; pl
 deliv_rel_col = mapper["DeliveryReliability"]; rej_pct_col = mapper["RejectionPct"]
 comp_obsol_pct_col = mapper["ComponentObsoletePct"]; rm_cost_pct_col = mapper["RMCostPct"]
 
-# Create a Round key even if only date exists
+# Create a Round key even if only date exists (weekly bucket)
 work = raw.copy()
 if round_col and round_col in work.columns:
     work["__ROUND__"] = work[round_col]
@@ -201,27 +214,24 @@ elif date_col and date_col in work.columns:
 else:
     work["__ROUND__"] = 1  # single bucket
 
-# ========================= AGGREGATION LAYER =========================
+# ========================= AGG LAYER (BY ROUND) =========================
 def agg_by_round(df):
-    out = pd.DataFrame({"Round": df["__ROUND__"].astype(str)})
-    out["Round"] = df["__ROUND__"].astype(str)
     g = df.groupby("__ROUND__")
     res = pd.DataFrame(index=g.size().index)
-    if roi_col:       res["ROI"] = to_num(g[roi_col].mean() if roi_col in g.obj else pd.Series(dtype=float))
-    if revenue_col:   res["Revenue"] = to_num(g[revenue_col].sum() if revenue_col in g.obj else pd.Series(dtype=float))
-    if cogs_col:      res["COGS"] = to_num(g[cogs_col].sum() if cogs_col in g.obj else pd.Series(dtype=float))
-    if indirect_col:  res["Indirect"] = to_num(g[indirect_col].sum() if indirect_col in g.obj else pd.Series(dtype=float))
+    if roi_col and roi_col in df.columns:       res["ROI"] = to_num(g[roi_col].mean())
+    if revenue_col and revenue_col in df.columns:   res["Revenue"] = to_num(g[revenue_col].sum())
+    if cogs_col and cogs_col in df.columns:      res["COGS"] = to_num(g[cogs_col].sum())
+    if indirect_col and indirect_col in df.columns: res["Indirect"] = to_num(g[indirect_col].sum())
     res = res.reset_index().rename(columns={"__ROUND__":"Round"})
     return res
 
-def attach_roi_by_round(df_sub, how="left"):
-    """Attach ROI by round to any dataset which has '__ROUND__'."""
+def attach_finance_by_round(df_sub, how="left"):
     base = agg_by_round(work)
     if "Round" not in df_sub.columns and "__ROUND__" in df_sub.columns:
         df_sub = df_sub.rename(columns={"__ROUND__":"Round"})
     if "Round" not in df_sub.columns:
         df_sub["Round"] = work["__ROUND__"]
-    return df_sub.merge(base[["Round","ROI","Revenue","COGS","Indirect"]], on="Round", how=how)
+    return df_sub.merge(base, on="Round", how=how)
 
 def group_metric(df, dim_col, val_col, agg="mean"):
     if not dim_col or not val_col or dim_col not in df.columns or val_col not in df.columns:
@@ -237,11 +247,12 @@ def group_metric(df, dim_col, val_col, agg="mean"):
     out = out.rename(columns={"__ROUND__":"Round", val_col:"Value"})
     return out
 
+# ========================= CHART HELPERS =========================
 def mk_scatter(data, x, y, color=None, title=""):
-    if len(data)==0: 
+    if len(data)==0:
         st.info(f"No rows for: {title}"); return
     if HAS_PLOTLY:
-        fig = px.scatter(data, x=x, y=y, color=color if color in data.columns else None, title=title)
+        fig = px.scatter(data, x=x, y=y, color=color if (color and color in data.columns) else None, title=title)
         st.plotly_chart(fig, use_container_width=True)
     elif alt:
         enc={'x':x,'y':y}
@@ -270,11 +281,12 @@ def mk_linebar(data, x, y, title, kind="line"):
 st.markdown('<div class="title">Ganga Jamuna — Executive VP Dashboard</div>', unsafe_allow_html=True)
 st.markdown('<div class="subtitle">Functional ↔ Financial KPIs • Fresh Connection (Rounds 0–6)</div>', unsafe_allow_html=True)
 
-# ========================= FINANCIALS TAB =========================
+# ========================= TABS =========================
 tab_fin, tab_sales, tab_scm, tab_ops, tab_purch = st.tabs(
     ["🏦 Financials", "🛒 Sales", "🔗 Supply Chain", "🏭 Operations", "📦 Purchasing"]
 )
 
+# ---- FINANCIALS
 with tab_fin:
     st.subheader("Financial KPIs")
     fin_by_round = agg_by_round(work)
@@ -282,85 +294,86 @@ with tab_fin:
     mk_linebar(fin_by_round.dropna(subset=["Revenue"]), "Round", "Revenue", "Realized Revenues by Round", "bar")
     mk_linebar(fin_by_round.dropna(subset=["COGS"]), "Round", "COGS", "COGS by Round", "bar")
     mk_linebar(fin_by_round.dropna(subset=["Indirect"]), "Round", "Indirect", "Indirect Cost by Round", "bar")
-    # Relationships (by Round)
-    if "Revenue" in fin_by_round.columns and "ROI" in fin_by_round.columns:
+    if {"Revenue","ROI"}.issubset(fin_by_round.columns):
         mk_scatter(fin_by_round.dropna(subset=["Revenue","ROI"]), "Revenue", "ROI", title="Revenue vs ROI (by Round)")
-    if "COGS" in fin_by_round.columns and "ROI" in fin_by_round.columns:
+    if {"COGS","ROI"}.issubset(fin_by_round.columns):
         mk_scatter(fin_by_round.dropna(subset=["COGS","ROI"]), "COGS", "ROI", title="COGS vs ROI (by Round)")
 
-# ========================= SALES TAB =========================
+# ---- SALES
 with tab_sales:
     st.subheader("VP Sales — KPI to Financial impact")
-    # Service Level vs ROI (by Customer), join on Round
     sl = group_metric(work, customer_col, service_level_col, "mean")
-    sl = attach_roi_by_round(sl)
-    mk_scatter(sl.dropna(subset=["Value","ROI"]).rename(columns={"Value":"Service Level"}), 
+    sl = attach_finance_by_round(sl)
+    mk_scatter(sl.dropna(subset=["Value","ROI"]).rename(columns={"Value":"Service Level"}),
                "Service Level", "ROI", color="Dim", title="Service Level vs ROI (by Customer / Round)")
     sh = group_metric(work, product_col, shelf_life_col, "mean")
-    sh = attach_roi_by_round(sh.merge(agg_by_round(work)[["Round","Revenue"]], on="Round", how="left"))
+    sh = attach_finance_by_round(sh)
     mk_scatter(sh.dropna(subset=["Value","Revenue"]).rename(columns={"Value":"Shelf Life"}),
                "Shelf Life", "Revenue", color="Dim", title="Shelf Life vs Revenue (by Product / Round)")
     fe = group_metric(work, customer_col, forecast_error_col, "mean")
-    fe = attach_roi_by_round(fe)
+    fe = attach_finance_by_round(fe)
     mk_scatter(fe.dropna(subset=["Value","ROI"]).rename(columns={"Value":"Forecast Error"}),
                "Forecast Error", "ROI", color="Dim", title="Forecast Error vs ROI (by Customer / Round)")
     ob = group_metric(work, product_col, obsolescence_pct_col, "mean")
-    ob = attach_roi_by_round(ob.merge(agg_by_round(work)[["Round","Revenue"]], on="Round", how="left"))
+    ob = attach_finance_by_round(ob)
     mk_scatter(ob.dropna(subset=["Value","Revenue"]).rename(columns={"Value":"Obsolescence %"}),
                "Obsolescence %", "Revenue", color="Dim", title="Obsolescence % vs Revenue (by Product / Round)")
 
-# ========================= SUPPLY CHAIN TAB =========================
+# ---- SUPPLY CHAIN
 with tab_scm:
     st.subheader("VP Supply Chain — Availability & Financials")
     comp = group_metric(work, component_col, comp_avail_col, "mean")
-    comp = attach_roi_by_round(comp.merge(agg_by_round(work)[["Round","Revenue"]], on="Round", how="left"))
+    comp = attach_finance_by_round(comp)
     if len(comp)>0:
         comp_agg = comp.groupby("Dim", as_index=False).agg({"Value":"mean","Revenue":"sum","ROI":"mean"}).rename(columns={"Value":"Component Avail"})
         mk_scatter(comp_agg, "Revenue", "ROI", color="Dim", title="Components — Revenue vs ROI (avg by component)")
     prod = group_metric(work, product_col, prod_avail_col, "mean")
-    prod = attach_roi_by_round(prod.merge(agg_by_round(work)[["Round","Revenue"]], on="Round", how="left"))
+    prod = attach_finance_by_round(prod)
     if len(prod)>0:
         prod_agg = prod.groupby("Dim", as_index=False).agg({"Value":"mean","Revenue":"sum","ROI":"mean"}).rename(columns={"Value":"Product Avail"})
         mk_scatter(prod_agg, "Revenue", "ROI", color="Dim", title="Products — Revenue vs ROI (avg by product)")
 
-# ========================= OPERATIONS TAB =========================
+# ---- OPERATIONS
 with tab_ops:
     st.subheader("VP Operations — Warehouses & Production")
     ib = group_metric(work, "__ROUND__", inb_util_col, "mean")
-    ib = attach_roi_by_round(ib.rename(columns={"Dim":"Round"}))
+    ib = attach_finance_by_round(ib.rename(columns={"Dim":"Round"}))
     mk_scatter(ib.dropna(subset=["Value","COGS"]).rename(columns={"Value":"Inbound Util"}),
                "Inbound Util", "COGS", title="Inbound WH Util vs COGS (by Round)")
     ob = group_metric(work, "__ROUND__", outb_util_col, "mean")
-    ob = attach_roi_by_round(ob.rename(columns={"Dim":"Round"}))
+    ob = attach_finance_by_round(ob.rename(columns={"Dim":"Round"}))
     mk_scatter(ob.dropna(subset=["Value","COGS"]).rename(columns={"Value":"Outbound Util"}),
                "Outbound Util", "COGS", title="Outbound WH Util vs COGS (by Round)")
     pa = group_metric(work, "__ROUND__", plan_adherence_col, "mean")
-    pa = attach_roi_by_round(pa.rename(columns={"Dim":"Round"}))
+    pa = attach_finance_by_round(pa.rename(columns={"Dim":"Round"}))
     mk_scatter(pa.dropna(subset=["Value","ROI"]).rename(columns={"Value":"Plan Adherence %"}),
                "Plan Adherence %", "ROI", title="Production Plan Adherence vs ROI (by Round)")
 
-# ========================= PURCHASING TAB =========================
+# ---- PURCHASING
 with tab_purch:
     st.subheader("VP Purchasing — Supplier Performance & Financials")
     dr = group_metric(work, supplier_col, deliv_rel_col, "mean")
-    dr = attach_roi_by_round(dr.merge(agg_by_round(work)[["Round","COGS"]], on="Round", how="left"))
-    mk_scatter(dr.groupby("Dim", as_index=False).agg({"Value":"mean","COGS":"sum","ROI":"mean"}).rename(columns={"Value":"Delivery Reliability"}),
+    dr = attach_finance_by_round(dr)
+    mk_scatter(dr.groupby("Dim", as_index=False).agg({"Value":"mean","ROI":"mean"}).rename(columns={"Value":"Delivery Reliability"}),
                "Delivery Reliability", "ROI", color="Dim", title="Delivery Reliability vs ROI (avg by supplier)")
     rj = group_metric(work, supplier_col, rej_pct_col, "mean")
-    rj = attach_roi_by_round(rj.merge(agg_by_round(work)[["Round","COGS"]], on="Round", how="left"))
-    mk_scatter(rj.groupby("Dim", as_index=False).agg({"Value":"mean","COGS":"sum","ROI":"mean"}).rename(columns={"Value":"Rejection %"}),
+    rj = attach_finance_by_round(rj)
+    mk_scatter(rj.groupby("Dim", as_index=False).agg({"Value":"mean","ROI":"mean"}).rename(columns={"Value":"Rejection %"}),
                "Rejection %", "ROI", color="Dim", title="Rejection % vs ROI (avg by supplier)")
     rm = group_metric(work, supplier_col, rm_cost_pct_col, "mean")
-    rm = attach_roi_by_round(rm.merge(agg_by_round(work)[["Round","COGS"]], on="Round", how="left"))
-    mk_scatter(rm.groupby("Dim", as_index=False).agg({"Value":"mean","COGS":"sum","ROI":"mean"}).rename(columns={"Value":"RM Cost %"}),
+    rm = attach_finance_by_round(rm)
+    mk_scatter(rm.groupby("Dim", as_index=False).agg({"Value":"mean","ROI":"mean"}).rename(columns={"Value":"RM Cost %"}),
                "RM Cost %", "ROI", color="Dim", title="RM Cost % vs ROI (avg by supplier)")
 
-# ========================= DIAGNOSTICS =========================
-with st.expander("📄 Data sources & mapping (diagnostics)"):
-    meta_df = pd.DataFrame(meta)
-    for c in meta_df.columns:
-        meta_df[c] = meta_df[c].apply(lambda x: json.dumps(x) if isinstance(x, (list, dict)) else x)
-    st.dataframe(meta_df, use_container_width=True)
+# ---- Diagnostics (safe)
+def safe_meta_dataframe(meta_list):
+    if not isinstance(meta_list, list): return pd.DataFrame()
+    df = pd.DataFrame(meta_list)
+    for c in df.columns:
+        if df[c].apply(lambda x: isinstance(x, (list, dict))).any():
+            df[c] = df[c].apply(lambda x: json.dumps(x) if isinstance(x, (list, dict)) else x)
+    return df
+
+with st.expander("📄 Data sources & mapping"):
+    st.dataframe(safe_meta_dataframe(meta), use_container_width=True)
     st.json(mapper)
-    st.markdown("<div class='note'>If a chart shows little or no data, use the KPI Mapper to select the correct columns. This version aggregates by Round and joins KPIs across sheets so graphs render even when metrics live on different tabs/files.</div>", unsafe_allow_html=True)
-'''
